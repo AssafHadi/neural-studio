@@ -1,4 +1,4 @@
-# UI_test.py  (Single-file: UI + ANN backend + LSTM backend)
+# UI_test.py (Single-file: UI + ANN backend + MULTIVARIATE LSTM backend)
 from __future__ import annotations
 
 import json
@@ -38,12 +38,55 @@ from sklearn.metrics import (
 
 from tensorflow.keras import layers
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 
 
 # ============================================================
-# ANN BACKEND (integrated)
+# Small utilities
+# ============================================================
+def _safe_index(options: List[Any], value: Any, default: int = 0) -> int:
+    try:
+        return options.index(value)
+    except Exception:
+        return default
+
+
+def _clamp_int(x: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        v = int(x)
+        return max(lo, min(hi, v))
+    except Exception:
+        return default
+
+
+def _clamp_float(x: Any, lo: float, hi: float, default: float) -> float:
+    try:
+        v = float(x)
+        return max(lo, min(hi, v))
+    except Exception:
+        return default
+
+
+# ============================================================
+# Navigation (Fixes the “double click” issue)
+# ============================================================
+def request_nav(page: str) -> None:
+    st.session_state["_nav_to"] = page
+
+
+def goto(page: str) -> None:
+    st.query_params["page"] = page
+    st.rerun()
+
+
+def apply_pending_nav() -> None:
+    nav_to = st.session_state.pop("_nav_to", None)
+    if nav_to:
+        goto(nav_to)
+
+
+# ============================================================
+# ANN BACKEND
 # ============================================================
 def infer_task(y: pd.Series) -> str:
     y_no_na = y.dropna()
@@ -132,18 +175,81 @@ def _make_preprocessor(X: pd.DataFrame) -> Tuple[ColumnTransformer, List[str], L
     return preprocessor, numeric_cols, categorical_cols
 
 
+def _map_activation(name: str) -> str:
+    name = (name or "").strip().lower()
+    if name in ["relu", "re-lu"]:
+        return "relu"
+    if name == "tanh":
+        return "tanh"
+    if name == "sigmoid":
+        return "sigmoid"
+    return "relu"
+
+
+def _build_ann_model(
+    input_dim: int,
+    task: str,
+    n_classes: int,
+    ann_config: Optional[Dict[str, Any]],
+    lr: float,
+) -> tf.keras.Model:
+    ann_config = ann_config or {}
+    hidden_layers = _clamp_int(ann_config.get("hidden_layers", 3), 1, 12, 3)
+
+    neurons = ann_config.get("neurons", [256, 128, 64])
+    if not isinstance(neurons, list):
+        neurons = [256, 128, 64]
+    neurons = (neurons + [64] * hidden_layers)[:hidden_layers]
+    neurons = [max(1, int(n)) for n in neurons]
+
+    act = _map_activation(ann_config.get("activation", "ReLU"))
+    out_choice = (ann_config.get("output_activation", "Auto") or "Auto").strip().lower()
+
+    model = tf.keras.Sequential()
+    model.add(layers.Input(shape=(input_dim,)))
+
+    for n in neurons:
+        model.add(layers.Dense(n, activation=act))
+        model.add(layers.Dropout(0.2))
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=float(lr))
+
+    if task == "classification":
+        if n_classes == 2:
+            out_units = 1
+            default_out_act = "sigmoid"
+            loss = "binary_crossentropy"
+        else:
+            out_units = n_classes
+            default_out_act = "softmax"
+            loss = "sparse_categorical_crossentropy"
+
+        out_act = default_out_act
+        if out_choice in ["sigmoid", "softmax", "linear"]:
+            out_act = out_choice
+
+        model.add(layers.Dense(out_units, activation=out_act))
+        model.compile(optimizer=optimizer, loss=loss, metrics=["accuracy"])
+    else:
+        model.add(layers.Dense(1, activation="linear"))
+        model.compile(optimizer=optimizer, loss="mse")
+
+    return model
+
+
 def train_ann_from_df(
-        df: pd.DataFrame,
-        target_col: str,
-        feature_cols: List[str],
-        task_choice: str = "auto",
-        test_size: float = 0.2,
-        epochs: int = 30,
-        batch_size: int = 32,
-        lr: float = 0.001,
-        early_stop: bool = True,
-        patience: int = 5,
-        seed: int = 42,
+    df: pd.DataFrame,
+    target_col: str,
+    feature_cols: List[str],
+    task_choice: str = "auto",
+    test_size: float = 0.2,
+    epochs: int = 30,
+    batch_size: int = 32,
+    lr: float = 0.001,
+    early_stop: bool = True,
+    patience: int = 5,
+    seed: int = 42,
+    ann_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[tf.keras.Model, ColumnTransformer, Optional[LabelEncoder], Dict[str, Any], Dict[str, List[float]]]:
     df = df.dropna(axis=1, how="all").dropna(axis=0, how="all").copy()
 
@@ -189,27 +295,13 @@ def train_ann_from_df(
     X_train_np = preprocessor.fit_transform(X_train)
     X_test_np = preprocessor.transform(X_test)
 
-    model = tf.keras.Sequential([
-        layers.Input(shape=(X_train_np.shape[1],)),
-        layers.Dense(256, activation="relu"),
-        layers.Dropout(0.2),
-        layers.Dense(128, activation="relu"),
-        layers.Dropout(0.2),
-        layers.Dense(64, activation="relu"),
-    ])
-
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-
-    if task == "classification":
-        if n_classes == 2:
-            model.add(layers.Dense(1, activation="sigmoid"))
-            model.compile(optimizer=optimizer, loss="binary_crossentropy", metrics=["accuracy"])
-        else:
-            model.add(layers.Dense(n_classes, activation="softmax"))
-            model.compile(optimizer=optimizer, loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-    else:
-        model.add(layers.Dense(1, activation="linear"))
-        model.compile(optimizer=optimizer, loss="mse")
+    model = _build_ann_model(
+        input_dim=int(X_train_np.shape[1]),
+        task=task,
+        n_classes=int(n_classes),
+        ann_config=ann_config,
+        lr=float(lr),
+    )
 
     callbacks = []
     if early_stop:
@@ -249,6 +341,7 @@ def train_ann_from_df(
             "f1_score": float(f1_score(y_test, y_pred, average="weighted", zero_division=0)),
             "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
             "classes": int(n_classes),
+            "class_labels": label_encoder.classes_.tolist() if label_encoder is not None else None,
         })
     else:
         preds = model.predict(X_test_np, verbose=0).reshape(-1)
@@ -265,11 +358,11 @@ def train_ann_from_df(
 
 
 def predict_from_df(
-        df_features: pd.DataFrame,
-        model: tf.keras.Model,
-        preprocessor: ColumnTransformer,
-        task: str,
-        label_encoder: Optional[LabelEncoder] = None,
+    df_features: pd.DataFrame,
+    model: tf.keras.Model,
+    preprocessor: ColumnTransformer,
+    task: str,
+    label_encoder: Optional[LabelEncoder] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     X = _expand_datetime_features(df_features)
     X_np = preprocessor.transform(X)
@@ -294,17 +387,19 @@ def predict_from_df(
 
 
 # ============================================================
-# LSTM BACKEND (integrated)
+# MULTIVARIATE LSTM BACKEND
 # ============================================================
 @dataclass
 class LSTMConfig:
     target_col: str
+    feature_cols: List[str]
     date_col: Optional[str] = None
 
     lookback: int = 10
+    horizon: int = 1
     test_size: float = 0.2
 
-    lstm_units: int = 50
+    lstm_units: int = 64
     dropout: float = 0.2
     epochs: int = 100
     batch_size: int = 32
@@ -319,70 +414,77 @@ def _set_seed(seed: int) -> None:
     tf.random.set_seed(seed)
 
 
-def _clean_series(df: pd.DataFrame, target_col: str, date_col: Optional[str]) -> Tuple[pd.DataFrame, np.ndarray]:
+def _coerce_numeric_series(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(s):
+        return s.astype(float)
+    if s.dtype == "object":
+        s = s.astype(str).str.replace(r"[^\d.-]", "", regex=True)
+    return pd.to_numeric(s, errors="coerce").astype(float)
+
+
+def _prepare_multivariate_frame(
+    df: pd.DataFrame,
+    target_col: str,
+    feature_cols: List[str],
+    date_col: Optional[str],
+) -> Tuple[pd.DataFrame, List[str]]:
     if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found in the dataset.")
+        raise ValueError(f"Target column '{target_col}' not found.")
+    for c in feature_cols:
+        if c not in df.columns:
+            raise ValueError(f"Feature column '{c}' not found.")
 
     work = df.copy()
 
-    # 1. Robust Target Cleaning
-    # If target is object/string, try to clean it (remove $, commas, etc.)
-    if work[target_col].dtype == "object":
-        work[target_col] = work[target_col].astype(str).str.replace(r'[^\d.-]', '', regex=True)
-
-    work[target_col] = pd.to_numeric(work[target_col], errors="coerce")
-
-    # Initial check: if everything is NaN, we can't proceed
-    if work[target_col].isna().all():
-        sample_vals = df[target_col].dropna().head(5).tolist()
-        raise ValueError(
-            f"Target column '{target_col}' contains no numeric values. "
-            f"Sample values found: {sample_vals}. LSTM requires numbers to forecast."
-        )
-
-    # 2. Robust Date Cleaning
     if date_col and date_col in work.columns:
         work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
-        # If date conversion failed for many rows, we might want to warn, but let's just drop invalid dates
         work = work.dropna(subset=[date_col])
         work = work.sort_values(date_col)
 
-    # 3. Final NaN handling
-    # Fill small gaps, then drop remaining NaNs
-    work[target_col] = work[target_col].ffill().bfill()
-    work = work.dropna(subset=[target_col])
+    X = work[feature_cols].copy()
+    X = _expand_datetime_features(X)
 
-    if len(work) < 2:
-        raise ValueError(
-            f"After cleaning, only {len(work)} valid numeric rows remain. "
-            "LSTM needs at least 2-3 points to function."
-        )
+    X = pd.get_dummies(X, dummy_na=True)
 
-    series = work[target_col].to_numpy().reshape(-1, 1)
-    return work, series
+    y = _coerce_numeric_series(work[target_col])
+
+    aligned = X.copy()
+    aligned["_target_"] = y.values
+
+    aligned = aligned.replace([np.inf, -np.inf], np.nan)
+    aligned = aligned.ffill().bfill()
+    aligned = aligned.dropna(axis=0, how="any")
+
+    if len(aligned) < 10:
+        raise ValueError(f"After cleaning, only {len(aligned)} usable rows remain. Need more data for LSTM.")
+
+    input_cols = [c for c in aligned.columns if c != "_target_"] + ["_target_"]
+    return aligned, input_cols
 
 
-def make_sequences(scaled: np.ndarray, lookback: int) -> Tuple[np.ndarray, np.ndarray]:
+def make_sequences_multivariate(arr: np.ndarray, lookback: int, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
     if lookback < 1:
         raise ValueError("lookback must be >= 1")
-    if len(scaled) <= lookback:
-        raise ValueError(f"Not enough data. Need more than lookback={lookback} rows.")
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+    if len(arr) <= lookback + horizon - 1:
+        raise ValueError("Not enough data for lookback+horizon.")
 
     X, y = [], []
-    for i in range(lookback, len(scaled)):
-        X.append(scaled[i - lookback: i, 0])
-        y.append(scaled[i, 0])
+    target_idx = arr.shape[1] - 1
+    for i in range(lookback, len(arr) - horizon + 1):
+        X.append(arr[i - lookback:i, :])
+        y.append(arr[i + horizon - 1, target_idx])
 
     X = np.array(X, dtype=np.float32)
     y = np.array(y, dtype=np.float32)
-    X = X.reshape((X.shape[0], X.shape[1], 1))
     return X, y
 
 
-def build_lstm(lookback: int, lstm_units: int, dropout: float) -> tf.keras.Model:
+def build_lstm_multivariate(lookback: int, n_channels: int, lstm_units: int, dropout: float) -> tf.keras.Model:
     model = Sequential(
         [
-            layers.Input(shape=(lookback, 1)),
+            layers.Input(shape=(lookback, n_channels)),
             layers.LSTM(lstm_units, return_sequences=True),
             layers.Dropout(dropout),
             layers.LSTM(lstm_units),
@@ -390,49 +492,54 @@ def build_lstm(lookback: int, lstm_units: int, dropout: float) -> tf.keras.Model
             layers.Dense(1),
         ]
     )
-    # Use a smaller learning rate and clipnorm to prevent NaNs from exploding gradients
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0)
     model.compile(optimizer=optimizer, loss="mse")
     return model
 
 
 def train_lstm_from_df(
-        df: pd.DataFrame,
-        cfg: LSTMConfig
-) -> Tuple[tf.keras.Model, MinMaxScaler, Dict[str, list], Dict[str, float], Dict[str, np.ndarray]]:
+    df: pd.DataFrame,
+    cfg: LSTMConfig
+) -> Tuple[tf.keras.Model, Dict[str, Any], Dict[str, list], Dict[str, float], Dict[str, np.ndarray]]:
     _set_seed(cfg.seed)
 
-    work, values = _clean_series(df, cfg.target_col, cfg.date_col)
+    aligned, input_cols = _prepare_multivariate_frame(df, cfg.target_col, cfg.feature_cols, cfg.date_col)
 
-    # Dynamically adjust lookback if data is too small
-    actual_lookback = cfg.lookback
-    if len(values) <= actual_lookback:
-        actual_lookback = max(1, len(values) - 2)
-        # We don't update cfg.lookback here because it's a dataclass passed by value/ref
-        # but we need to use actual_lookback for the rest of the function
+    Xy = aligned[[c for c in input_cols if c != "_target_"]].to_numpy(dtype=np.float32)
+    y = aligned["_target_"].to_numpy(dtype=np.float32).reshape(-1, 1)
+    full = np.concatenate([Xy, y], axis=1)
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled = scaler.fit_transform(values)
+    split_idx = int(len(full) * (1 - cfg.test_size))
+    split_idx = max(2, min(split_idx, len(full) - 1))
 
-    try:
-        X, y = make_sequences(scaled, actual_lookback)
-    except ValueError as e:
-        raise ValueError(f"Data too small for LSTM: {e}")
+    train_full = full[:split_idx]
+    test_full = full[split_idx:]
 
-    # Ensure we have at least 1 sample for training and 1 for testing if possible
-    if len(X) < 2:
-        # If only 1 sequence possible, use it for training and test
-        X_train, y_train = X, y
-        X_test, y_test = X, y
-    else:
-        split_idx = int(len(X) * (1 - cfg.test_size))
-        if split_idx < 1: split_idx = 1
-        if split_idx >= len(X): split_idx = len(X) - 1
+    scaler_all = MinMaxScaler(feature_range=(0, 1))
+    scaler_y = MinMaxScaler(feature_range=(0, 1))
 
-        X_train, y_train = X[:split_idx], y[:split_idx]
-        X_test, y_test = X[split_idx:], y[split_idx:]
+    train_scaled = scaler_all.fit_transform(train_full)
+    test_scaled = scaler_all.transform(test_full)
 
-    model = build_lstm(actual_lookback, cfg.lstm_units, cfg.dropout)
+    scaler_y.fit(train_full[:, [-1]])
+
+    scaled_full = np.vstack([train_scaled, test_scaled]).astype(np.float32)
+
+    lookback = int(cfg.lookback)
+    horizon = int(cfg.horizon)
+    if len(scaled_full) <= lookback + horizon:
+        lookback = max(1, len(scaled_full) - horizon - 1)
+
+    X_seq, y_seq = make_sequences_multivariate(scaled_full, lookback=lookback, horizon=horizon)
+
+    seq_split = int(len(X_seq) * (1 - cfg.test_size))
+    seq_split = max(1, min(seq_split, len(X_seq) - 1))
+
+    X_train, y_train = X_seq[:seq_split], y_seq[:seq_split]
+    X_test, y_test = X_seq[seq_split:], y_seq[seq_split:]
+
+    n_channels = int(X_train.shape[2])
+    model = build_lstm_multivariate(lookback, n_channels, cfg.lstm_units, cfg.dropout)
 
     cb = EarlyStopping(monitor="val_loss", patience=cfg.patience, restore_best_weights=True)
     hist = model.fit(
@@ -446,69 +553,89 @@ def train_lstm_from_df(
     )
     history = {k: [float(x) for x in v] for k, v in hist.history.items()}
 
-    train_pred = model.predict(X_train, verbose=0)
-    test_pred = model.predict(X_test, verbose=0)
+    train_pred = model.predict(X_train, verbose=0).reshape(-1, 1)
+    test_pred = model.predict(X_test, verbose=0).reshape(-1, 1)
 
-    y_train_actual = scaler.inverse_transform(y_train.reshape(-1, 1))
-    y_test_actual = scaler.inverse_transform(y_test.reshape(-1, 1))
-    train_pred_actual = scaler.inverse_transform(train_pred)
-    test_pred_actual = scaler.inverse_transform(test_pred)
+    y_train_actual = scaler_y.inverse_transform(y_train.reshape(-1, 1))
+    y_test_actual = scaler_y.inverse_transform(y_test.reshape(-1, 1))
+    train_pred_actual = scaler_y.inverse_transform(train_pred)
+    test_pred_actual = scaler_y.inverse_transform(test_pred)
 
-    # --- SAFETY: remove NaNs before metrics ---
-    y_test_actual_flat = np.asarray(y_test_actual).reshape(-1)
-    test_pred_actual_flat = np.asarray(test_pred_actual).reshape(-1)
-    mask = np.isfinite(y_test_actual_flat) & np.isfinite(test_pred_actual_flat)
-
+    y_test_flat = y_test_actual.reshape(-1)
+    pred_flat = test_pred_actual.reshape(-1)
+    mask = np.isfinite(y_test_flat) & np.isfinite(pred_flat)
     if mask.sum() == 0:
-        # Fallback if all predictions are NaN
-        rmse, mae, r2 = 0.0, 0.0, 0.0
+        rmse = mae = r2 = 0.0
     else:
-        y_test_clean = y_test_actual_flat[mask]
-        test_pred_clean = test_pred_actual_flat[mask]
-        rmse = float(np.sqrt(mean_squared_error(y_test_clean, test_pred_clean)))
-        mae = float(mean_absolute_error(y_test_clean, test_pred_clean))
+        rmse = float(np.sqrt(mean_squared_error(y_test_flat[mask], pred_flat[mask])))
+        mae = float(mean_absolute_error(y_test_flat[mask], pred_flat[mask]))
         try:
-            r2 = float(r2_score(y_test_clean, test_pred_clean))
-        except:
+            r2 = float(r2_score(y_test_flat[mask], pred_flat[mask]))
+        except Exception:
             r2 = 0.0
 
-    metrics = {"rmse": rmse, "mae": mae, "r2_score": r2, "task": "regression"}
+    metrics = {
+        "task": "regression",
+        "rmse": rmse,
+        "mae": mae,
+        "r2_score": r2,
+        "lookback_used": int(lookback),
+        "horizon_used": int(horizon),
+        "channels_used": int(n_channels),
+        "rows_used": int(len(aligned)),
+        "train_sequences": int(len(X_train)),
+        "test_sequences": int(len(X_test)),
+    }
+
+    pack = {
+        "scaler_all": scaler_all,
+        "scaler_y": scaler_y,
+        "input_feature_columns": [c for c in input_cols if c != "_target_"],
+        "target_column": cfg.target_col,
+    }
+
+    last_feature_scaled = scaled_full[-1, :-1].astype(np.float32)
 
     outputs = {
+        "scaled_full": scaled_full.astype(np.float32),
+        "lookback": np.array([lookback], dtype=np.int32),
+        "horizon": np.array([horizon], dtype=np.int32),
+        "last_feature_scaled": last_feature_scaled.astype(np.float32),
         "y_train_actual": y_train_actual.astype(np.float32),
         "y_test_actual": y_test_actual.astype(np.float32),
         "train_pred_actual": train_pred_actual.astype(np.float32),
         "test_pred_actual": test_pred_actual.astype(np.float32),
-        "scaled_full": scaled.astype(np.float32),
-        "lookback": np.array([actual_lookback], dtype=np.int32),
     }
 
-    return model, scaler, history, metrics, outputs
+    return model, pack, history, metrics, outputs
 
 
-def forecast_future(
-        model: tf.keras.Model,
-        scaler: MinMaxScaler,
-        scaled_full: np.ndarray,
-        lookback: int,
-        n_steps: int,
+def forecast_future_multivariate(
+    model: tf.keras.Model,
+    scaler_y: MinMaxScaler,
+    scaled_full: np.ndarray,
+    lookback: int,
+    n_steps: int,
+    last_feature_scaled: np.ndarray,
 ) -> np.ndarray:
     if n_steps < 1:
         raise ValueError("n_steps must be >= 1")
     if len(scaled_full) <= lookback:
         raise ValueError("Not enough history to forecast. Increase data or reduce lookback.")
 
-    last_seq = scaled_full[-lookback:].reshape(1, lookback, 1).astype(np.float32)
+    n_channels = scaled_full.shape[1]
+    curr = scaled_full[-lookback:, :].reshape(1, lookback, n_channels).astype(np.float32)
 
-    preds = []
-    curr = last_seq.copy()
+    preds_scaled = []
     for _ in range(n_steps):
-        p = model.predict(curr, verbose=0)
-        preds.append(float(p[0, 0]))
-        curr = np.append(curr[:, 1:, :], p.reshape(1, 1, 1), axis=1)
+        p = model.predict(curr, verbose=0).reshape(-1)[0]
+        preds_scaled.append(p)
 
-    preds = np.array(preds, dtype=np.float32).reshape(-1, 1)
-    preds_inv = scaler.inverse_transform(preds)
+        next_row = np.concatenate([last_feature_scaled, np.array([p], dtype=np.float32)], axis=0).reshape(1, 1, n_channels)
+        curr = np.concatenate([curr[:, 1:, :], next_row], axis=1)
+
+    preds_scaled = np.array(preds_scaled, dtype=np.float32).reshape(-1, 1)
+    preds_inv = scaler_y.inverse_transform(preds_scaled)
     return preds_inv
 
 
@@ -562,7 +689,7 @@ def upsert_project(project: Dict[str, Any]) -> None:
 
 
 # ============================================================
-# UI helpers (unchanged styling)
+# UI helpers (styling)
 # ============================================================
 def inject_css():
     st.markdown(
@@ -718,16 +845,13 @@ def new_project() -> Dict[str, Any]:
     p = {
         "id": str(uuid.uuid4()),
         "name": f"Project {time.strftime('%Y-%m-%d')}",
-        "task_type": "classification",  # classification | regression | auto-detect
-        "model_type": "ann",  # ann | lstm
+        "task_type": "classification",
+        "model_type": "ann",
         "status": "data_loaded",
-        "dataset": {"filename": "—", "rows": 0, "cols": 0, "missing": 0, "path": None, "file_type": None,
-                    "sheet": None},
+        "dataset": {"filename": "—", "rows": 0, "cols": 0, "missing": 0, "path": None, "file_type": None, "sheet": None},
         "columns": {"target": None, "time": None, "features": []},
         "preprocess": {
             "missing_strategy": "Drop rows",
-            "scaling": "Standard Scaler",
-            "encoding": "One-Hot Encoding",
             "split": 0.8,
             "seed": 42,
             "lookback": 20,
@@ -739,6 +863,9 @@ def new_project() -> Dict[str, Any]:
         "evaluation_metrics": None,
         "artifacts": None,
         "feature_meta": {},
+        "viz_cache": {},
+        "ann_config": {"hidden_layers": 3, "neurons": [256, 128, 64], "activation": "ReLU", "output_activation": "Auto"},
+        "lstm_config": {"units": 64, "layers": 2, "dropout": 0.2, "bidirectional": False},
     }
     upsert_project(p)
     return p
@@ -773,11 +900,20 @@ def cached_load_ann_artifacts(model_path: str, preprocessor_path: str, label_enc
 
 
 @st.cache_resource(show_spinner=False)
-def cached_load_lstm_artifacts(model_path: str, scaler_path: str, outputs_path: str):
+def cached_load_lstm_artifacts(model_path: str, pack_path: str, outputs_path: str):
     model = tf.keras.models.load_model(model_path)
-    scaler = joblib.load(scaler_path)
+    pack = joblib.load(pack_path)
     outputs = np.load(outputs_path, allow_pickle=False)
-    return model, scaler, outputs
+    return model, pack, outputs
+
+
+@st.cache_data(show_spinner=False)
+def cached_feature_meta(dataset_path: str, file_type: str, sheet: Optional[str], features: Tuple[str, ...]) -> Dict[str, Any]:
+    if file_type == "csv":
+        df_full = pd.read_csv(dataset_path)
+    else:
+        df_full = pd.read_excel(dataset_path, sheet_name=sheet)
+    return build_feature_meta(df_full, list(features))
 
 
 # ============================================================
@@ -829,9 +965,7 @@ def page_home():
     c1, c2 = st.columns([1, 1])
     with c1:
         st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-        if st.button("➕ New Project", use_container_width=True):
-            new_project()
-            st.success("New project created. Go to Data Upload.")
+        st.button("➕ New Project", use_container_width=True, on_click=lambda: (new_project(), request_nav("data")))
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c2:
@@ -844,10 +978,10 @@ def page_home():
     feats = [
         ("📤", "Upload Data", "CSV/Excel upload with preview & column selection"),
         ("🧹", "Preprocess", "Split settings are used in training"),
-        ("🧠", "Design Model", "ANN + LSTM configuration"),
+        ("🧠", "Design Model", "ANN + Multivariate LSTM configuration"),
         ("🏋️", "Train", "Real training + saved model artifacts"),
-        ("✅", "Evaluate", "Real metrics + confusion matrix (ANN classification)"),
-        ("🔮", "Predict", "ANN manual/batch • LSTM future forecast"),
+        ("✅", "Evaluate", "Real metrics + labeled confusion matrix (ANN classification)"),
+        ("🔮", "Predict", "ANN manual/batch • LSTM future forecast (features held constant if unknown)"),
     ]
     cols = st.columns(3)
     for i, (ico, title, desc) in enumerate(feats):
@@ -880,7 +1014,7 @@ def page_home():
                 st.write(f"Rows: {ds.get('rows', 0)} • Cols: {ds.get('cols', 0)} • Missing: {ds.get('missing', 0)}")
                 if st.button("Open Project", key=f"open_{p.get('id')}"):
                     set_current_project(p)
-                    st.success("Project opened as current.")
+                    request_nav("data")
                 st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -928,6 +1062,7 @@ def page_data():
 
         try:
             cached_load_dataset.clear()
+            cached_feature_meta.clear()
         except Exception:
             pass
 
@@ -946,6 +1081,15 @@ def page_data():
         p["evaluation_metrics"] = None
         p["artifacts"] = None
         p["history"] = {"loss": [], "val_loss": []}
+        p.setdefault("viz_cache", {})
+        p["viz_cache"].pop("ann_regression", None)
+
+        # reset selections
+        p["columns"]["target"] = None
+        p["columns"]["time"] = None
+        p["columns"]["features"] = []
+        p["feature_meta"] = {}
+
         upsert_project(p)
 
     ds = p.get("dataset", {})
@@ -967,38 +1111,41 @@ def page_data():
         st.write("")
         st.markdown('<div class="ns-card">', unsafe_allow_html=True)
         st.write("### Column Configuration")
-        target = st.selectbox(
-            "Target Column (what to predict)",
-            cols,
-            index=cols.index(p["columns"]["target"]) if p["columns"]["target"] in cols else 0
-        )
 
-        time_col = st.selectbox(
-            "Time Column (optional, for time series)",
-            ["(None)"] + cols,
-            index=(cols.index(p["columns"]["time"]) + 1) if p["columns"]["time"] in cols else 0
-        )
+        saved_target = p.get("columns", {}).get("target")
+        target = st.selectbox("Target Column (what to predict)", cols, index=_safe_index(cols, saved_target, 0))
 
-        features = st.multiselect(
-            "Feature Columns (inputs)",
-            [c for c in cols if c != target],
-            default=p["columns"]["features"] if p["columns"]["features"] else [c for c in cols if c != target][
-                                                                              : min(6, max(0, len(cols) - 1))],
-        )
+        time_options = ["(None)"] + [c for c in cols if c != target]
+        saved_time = p.get("columns", {}).get("time")
+        time_default = "(None)" if (saved_time is None or saved_time == target or saved_time not in time_options) else saved_time
+        time_col = st.selectbox("Time Column (optional, for time series)", time_options, index=_safe_index(time_options, time_default, 0))
+
+        feature_options = [c for c in cols if c != target]
+        saved_features = p.get("columns", {}).get("features", []) or []
+        safe_defaults = [c for c in saved_features if c in feature_options]
+        if not safe_defaults:
+            safe_defaults = feature_options[: min(6, len(feature_options))]
+
+        features = st.multiselect("Feature Columns (inputs)", feature_options, default=safe_defaults)
 
         p["columns"]["target"] = target
         p["columns"]["time"] = None if time_col == "(None)" else time_col
-        p["columns"]["features"] = features
+        p["columns"]["features"] = [c for c in features if c != target]
 
         try:
-            df_full = load_project_dataset(p)
-            p["feature_meta"] = build_feature_meta(df_full, features)
+            ds_path = p.get("dataset", {}).get("path")
+            ds_type = p.get("dataset", {}).get("file_type")
+            ds_sheet = p.get("dataset", {}).get("sheet")
+            if ds_path and p["columns"]["features"]:
+                p["feature_meta"] = cached_feature_meta(ds_path, ds_type, ds_sheet, tuple(p["columns"]["features"]))
+            else:
+                p["feature_meta"] = {}
         except Exception:
             p["feature_meta"] = {}
 
         upsert_project(p)
 
-        st.caption(f"Selected features: {len(features)}")
+        st.caption(f"Selected features: {len(p['columns']['features'])}")
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.write("")
@@ -1011,8 +1158,7 @@ def page_data():
 
         st.write("")
         st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-        if st.button("Continue to Preprocessing ➜", use_container_width=True):
-            st.query_params["page"] = "preprocess"
+        st.button("Continue to Preprocessing ➜", use_container_width=True, on_click=request_nav, args=("preprocess",))
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.info("Upload a CSV/Excel to enable column selection and preview.")
@@ -1033,8 +1179,7 @@ def page_preprocess():
     st.markdown('<div class="ns-card">', unsafe_allow_html=True)
     st.write("### Dataset Summary")
     st.write(f"**Project:** {p.get('name')}")
-    st.write(
-        f"**Rows:** {ds.get('rows', 0)} • **Features:** {len(cols_cfg.get('features', []))} • **Target:** {cols_cfg.get('target', '—')}")
+    st.write(f"**Rows:** {ds.get('rows', 0)} • **Features:** {len(cols_cfg.get('features', []))} • **Target:** {cols_cfg.get('target', '—')}")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
@@ -1043,29 +1188,26 @@ def page_preprocess():
     p["preprocess"]["missing_strategy"] = st.selectbox(
         "Strategy",
         ["Drop rows", "Fill with mean/median", "Forward fill (time-series)"],
-        index=["Drop rows", "Fill with mean/median", "Forward fill (time-series)"].index(
-            p["preprocess"]["missing_strategy"]),
+        index=_safe_index(["Drop rows", "Fill with mean/median", "Forward fill (time-series)"], p["preprocess"].get("missing_strategy"), 0),
     )
-    st.caption("ANN uses imputers automatically; LSTM uses forward/back fill on the target series.")
+    st.caption("ANN uses imputers automatically; LSTM cleans & forward/back fills after encoding.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
     st.markdown('<div class="ns-card">', unsafe_allow_html=True)
     st.write("### Train/Test Split")
-    split = st.slider("Train %", 50, 95, int(p["preprocess"]["split"] * 100))
+    split = st.slider("Train %", 50, 95, int(float(p["preprocess"].get("split", 0.8)) * 100))
     p["preprocess"]["split"] = split / 100.0
-    p["preprocess"]["seed"] = st.number_input("Random Seed", value=int(p["preprocess"]["seed"]), step=1)
+    p["preprocess"]["seed"] = st.number_input("Random Seed", value=int(p["preprocess"].get("seed", 42)), step=1)
     st.caption(f"Train: {split}% • Test: {100 - split}%")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
     st.markdown('<div class="ns-card" style="border-color:#c4b5fd; background:#faf5ff;">', unsafe_allow_html=True)
     st.write("### LSTM / Time Series Settings")
-    p["preprocess"]["lookback"] = st.number_input("Lookback window", value=int(p["preprocess"]["lookback"]),
-                                                  min_value=1, step=1)
-    p["preprocess"]["horizon"] = st.number_input("Forecast horizon", value=int(p["preprocess"]["horizon"]), min_value=1,
-                                                 step=1)
-    st.caption("Horizon is used in the Predict page for future steps.")
+    p["preprocess"]["lookback"] = st.number_input("Lookback window", value=int(p["preprocess"].get("lookback", 20)), min_value=1, step=1)
+    p["preprocess"]["horizon"] = st.number_input("Forecast horizon (steps ahead)", value=int(p["preprocess"].get("horizon", 1)), min_value=1, step=1)
+    st.caption("Multivariate LSTM will use: past lookback rows of (features + target) to predict target at horizon.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     upsert_project(p)
@@ -1073,14 +1215,14 @@ def page_preprocess():
     st.write("")
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("⬅ Back to Data", use_container_width=True):
-            st.query_params["page"] = "data"
+        st.button("⬅ Back to Data", use_container_width=True, on_click=request_nav, args=("data",))
     with c2:
         st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-        if st.button("Continue to Model Configuration ➜", use_container_width=True):
-            p["status"] = "preprocessed"
-            upsert_project(p)
-            st.query_params["page"] = "model"
+        st.button(
+            "Continue to Model Configuration ➜",
+            use_container_width=True,
+            on_click=lambda: (p.__setitem__("status", "preprocessed"), upsert_project(p), request_nav("model")),
+        )
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1105,7 +1247,7 @@ def page_model():
     task_type = st.selectbox(
         "Task",
         ["auto-detect", "classification", "regression"],
-        index=["auto-detect", "classification", "regression"].index(p.get("task_type", "classification"))
+        index=_safe_index(["auto-detect", "classification", "regression"], p.get("task_type", "classification"), 1),
     )
     p["task_type"] = task_type
     st.caption("For LSTM, task is always regression (time-series forecasting).")
@@ -1114,50 +1256,43 @@ def page_model():
     st.write("")
     if model_type == "ann":
         st.markdown('<div class="ns-card" style="background:#faf5ff; border-color:#ddd6fe;">', unsafe_allow_html=True)
-        st.write("### ANN Configuration")
+        st.write("### ANN Configuration (Applied for real ✅)")
         p.setdefault("ann_config", {})
-        p["ann_config"]["hidden_layers"] = st.number_input("Hidden layers", min_value=1, max_value=6,
-                                                           value=int(p["ann_config"].get("hidden_layers", 3)))
+        p["ann_config"]["hidden_layers"] = st.number_input("Hidden layers", min_value=1, max_value=12, value=int(p["ann_config"].get("hidden_layers", 3)))
         hl = int(p["ann_config"]["hidden_layers"])
         neurons = p["ann_config"].get("neurons", [256, 128, 64])
+        if not isinstance(neurons, list):
+            neurons = [256, 128, 64]
         neurons = (neurons + [64] * hl)[:hl]
         new_neurons = []
         for i in range(hl):
-            new_neurons.append(
-                int(st.number_input(f"Neurons in layer {i + 1}", min_value=1, max_value=1024, value=int(neurons[i]))))
+            new_neurons.append(int(st.number_input(f"Neurons in layer {i + 1}", min_value=1, max_value=2048, value=int(neurons[i]))))
         p["ann_config"]["neurons"] = new_neurons
-        p["ann_config"]["activation"] = st.selectbox("Activation", ["ReLU", "Tanh", "Sigmoid"],
-                                                     index=["ReLU", "Tanh", "Sigmoid"].index(
-                                                         p["ann_config"].get("activation", "ReLU")))
-        p["ann_config"]["output_activation"] = st.selectbox("Output activation",
-                                                            ["Auto", "Linear", "Sigmoid", "Softmax"],
-                                                            index=["Auto", "Linear", "Sigmoid", "Softmax"].index(
-                                                                p["ann_config"].get("output_activation", "Auto")))
-        st.caption("Backend uses strong ANN defaults; these UI knobs are stored but not mapped layer-by-layer yet.")
+        p["ann_config"]["activation"] = st.selectbox("Activation", ["ReLU", "Tanh", "Sigmoid"], index=_safe_index(["ReLU", "Tanh", "Sigmoid"], p["ann_config"].get("activation", "ReLU"), 0))
+        p["ann_config"]["output_activation"] = st.selectbox("Output activation", ["Auto", "Linear", "Sigmoid", "Softmax"], index=_safe_index(["Auto", "Linear", "Sigmoid", "Softmax"], p["ann_config"].get("output_activation", "Auto"), 0))
+        st.caption("These settings are used during ANN training.")
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.markdown('<div class="ns-card" style="background:#ecfeff; border-color:#a5f3fc;">', unsafe_allow_html=True)
-        st.write("### LSTM Configuration")
+        st.write("### LSTM Configuration (Multivariate ✅)")
         p.setdefault("lstm_config", {})
-        p["lstm_config"]["units"] = st.number_input("LSTM units", min_value=1, max_value=1024,
-                                                    value=int(p["lstm_config"].get("units", 64)))
-        p["lstm_config"]["layers"] = st.number_input("Number of LSTM layers", min_value=1, max_value=6,
-                                                     value=int(p["lstm_config"].get("layers", 2)))
+        p["lstm_config"]["units"] = st.number_input("LSTM units", min_value=1, max_value=2048, value=int(p["lstm_config"].get("units", 64)))
+        p["lstm_config"]["layers"] = st.number_input("Number of LSTM layers (stored)", min_value=1, max_value=6, value=int(p["lstm_config"].get("layers", 2)))
         p["lstm_config"]["dropout"] = st.slider("Dropout rate", 0.0, 0.8, float(p["lstm_config"].get("dropout", 0.2)))
-        p["lstm_config"]["bidirectional"] = st.checkbox("Bidirectional",
-                                                        value=bool(p["lstm_config"].get("bidirectional", False)))
-        st.caption("This implementation trains a strong 2-layer LSTM (as in your backend). Extra UI fields are stored.")
+        p["lstm_config"]["bidirectional"] = st.checkbox("Bidirectional (stored)", value=bool(p["lstm_config"].get("bidirectional", False)))
+        st.caption("This LSTM uses selected FEATURES + past TARGET to predict future TARGET.")
         st.markdown("</div>", unsafe_allow_html=True)
+
+    upsert_project(p)
 
     st.write("")
     st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-    if st.button("Continue to Training ➜", use_container_width=True):
-        p["status"] = "configured"
-        upsert_project(p)
-        st.query_params["page"] = "train"
+    st.button(
+        "Continue to Training ➜",
+        use_container_width=True,
+        on_click=lambda: (p.__setitem__("status", "configured"), upsert_project(p), request_nav("train")),
+    )
     st.markdown("</div>", unsafe_allow_html=True)
-
-    upsert_project(p)
 
 
 def page_train():
@@ -1187,17 +1322,13 @@ def page_train():
     st.write("### Training Configuration")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        p["train_config"]["epochs"] = int(
-            st.number_input("Epochs", min_value=1, max_value=500, value=int(p["train_config"]["epochs"])))
+        p["train_config"]["epochs"] = int(st.number_input("Epochs", min_value=1, max_value=500, value=int(p["train_config"]["epochs"])))
     with c2:
-        p["train_config"]["batch_size"] = int(
-            st.number_input("Batch size", min_value=1, max_value=2048, value=int(p["train_config"]["batch_size"])))
+        p["train_config"]["batch_size"] = int(st.number_input("Batch size", min_value=1, max_value=2048, value=int(p["train_config"]["batch_size"])))
     with c3:
-        p["train_config"]["lr"] = float(st.number_input("Learning rate (ANN only)", min_value=1e-6, max_value=1.0,
-                                                        value=float(p["train_config"]["lr"]), format="%.6f"))
+        p["train_config"]["lr"] = float(st.number_input("Learning rate (ANN only)", min_value=1e-6, max_value=1.0, value=float(p["train_config"]["lr"]), format="%.6f"))
     with c4:
-        p["train_config"]["patience"] = int(
-            st.number_input("Early stop patience", min_value=1, max_value=50, value=int(p["train_config"]["patience"])))
+        p["train_config"]["patience"] = int(st.number_input("Early stop patience", min_value=1, max_value=50, value=int(p["train_config"]["patience"])))
     p["train_config"]["early_stop"] = st.checkbox("Enable early stopping", value=bool(p["train_config"]["early_stop"]))
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1247,8 +1378,6 @@ def page_train():
                 st.error("Select feature columns in Data page first (ANN needs features).")
                 return
 
-            p["feature_meta"] = build_feature_meta(df, feature_cols)
-
             ui_task = p.get("task_type", "classification")
             task_choice = "auto" if ui_task == "auto-detect" else ui_task
 
@@ -1265,7 +1394,45 @@ def page_train():
                     early_stop=early_stop,
                     patience=patience,
                     seed=seed,
+                    ann_config=p.get("ann_config", {}),
                 )
+
+            # -----------------------------
+            # Save residual plot data for ANN regression (so Visualize can plot it)
+            # -----------------------------
+            try:
+                if results.get("task") == "regression":
+                    X_full = df[feature_cols].copy()
+                    y_full = pd.to_numeric(df[target], errors="coerce").astype(float).values
+
+                    keep = ~np.isnan(y_full)
+                    X_full = X_full.loc[keep].reset_index(drop=True)
+                    y_full = y_full[keep]
+
+                    X_full = _expand_datetime_features(X_full)
+
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X_full,
+                        y_full,
+                        test_size=test_size,
+                        random_state=seed,
+                        shuffle=True,
+                    )
+
+                    X_test_np = preprocessor.transform(X_test)
+                    y_pred = model.predict(X_test_np, verbose=0).reshape(-1)
+
+                    p.setdefault("viz_cache", {})
+                    p["viz_cache"]["ann_regression"] = {
+                        "y_test": y_test.tolist(),
+                        "y_pred": y_pred.tolist(),
+                    }
+                else:
+                    p.setdefault("viz_cache", {})
+                    p["viz_cache"].pop("ann_regression", None)
+            except Exception:
+                p.setdefault("viz_cache", {})
+                p["viz_cache"].pop("ann_regression", None)
 
             model_path = MODELS_DIR / "model.keras"
             prep_path = MODELS_DIR / "preprocessor.joblib"
@@ -1294,13 +1461,16 @@ def page_train():
             st.success("Training finished (ANN). You can now Evaluate / Predict / Visualize.")
 
         else:
-            if feature_cols:
-                st.info("Note: LSTM uses ONLY the target series (features are ignored in this version).")
+            if not feature_cols:
+                st.error("For MULTIVARIATE LSTM, please select feature columns in Data page.")
+                return
 
             cfg = LSTMConfig(
                 target_col=target,
+                feature_cols=feature_cols,
                 date_col=time_col,
                 lookback=int(p["preprocess"]["lookback"]),
+                horizon=int(p["preprocess"]["horizon"]),
                 test_size=float(test_size),
                 lstm_units=int(p.get("lstm_config", {}).get("units", 64)),
                 dropout=float(p.get("lstm_config", {}).get("dropout", 0.2)),
@@ -1311,15 +1481,15 @@ def page_train():
                 val_split=0.1,
             )
 
-            with st.spinner("Training model (real LSTM)..."):
-                model, scaler, history, metrics, outputs = train_lstm_from_df(df, cfg)
+            with st.spinner("Training model (real MULTIVARIATE LSTM)..."):
+                model, pack, history, metrics, outputs = train_lstm_from_df(df, cfg)
 
             model_path = MODELS_DIR / "lstm_model.keras"
-            scaler_path = MODELS_DIR / "lstm_scaler.joblib"
+            pack_path = MODELS_DIR / "lstm_pack.joblib"
             outputs_path = MODELS_DIR / "lstm_outputs.npz"
 
             model.save(model_path)
-            joblib.dump(scaler, scaler_path)
+            joblib.dump(pack, pack_path)
             np.savez_compressed(outputs_path, **outputs)
 
             try:
@@ -1327,40 +1497,25 @@ def page_train():
             except Exception:
                 pass
 
-            # Get the actual lookback used (it might have been adjusted)
             used_lookback = int(outputs["lookback"][0]) if "lookback" in outputs else cfg.lookback
 
             p["artifacts"] = {
                 "kind": "lstm",
                 "model_path": str(model_path),
-                "scaler_path": str(scaler_path),
+                "pack_path": str(pack_path),
                 "outputs_path": str(outputs_path),
                 "lookback": used_lookback,
             }
-            p["history"] = {
-                "loss": history.get("loss", []),
-                "val_loss": history.get("val_loss", []),
-            }
+            p["history"] = {"loss": history.get("loss", []), "val_loss": history.get("val_loss", [])}
             p["evaluation_metrics"] = metrics
             p["status"] = "trained"
             upsert_project(p)
 
-            st.success("Training finished (LSTM). You can now Evaluate / Predict / Visualize.")
-
-    st.write("")
-    st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-    st.write("### Training Logs")
-    logs = p.get("train_logs", [])
-    if logs:
-        st.code("\n".join(logs[-30:]), language="text")
-    else:
-        st.caption("Logs are minimal in this version (Keras training is silent).")
-    st.markdown("</div>", unsafe_allow_html=True)
+            st.success("Training finished (Multivariate LSTM). You can now Evaluate / Predict / Visualize.")
 
     st.write("")
     st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-    if st.button("⚡ Evaluate Model", use_container_width=True):
-        st.query_params["page"] = "evaluate"
+    st.button("⚡ Evaluate Model", use_container_width=True, on_click=request_nav, args=("evaluate",))
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1394,30 +1549,39 @@ def page_evaluate():
 
         st.write("")
         st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-        st.write("### Confusion Matrix")
+        st.write("### Confusion Matrix (labeled)")
         cm = metrics.get("confusion_matrix", [[0, 0], [0, 0]])
-        st.dataframe(pd.DataFrame(cm), use_container_width=True)
+        labels = metrics.get("class_labels") or None
+        cm_df = pd.DataFrame(cm)
+        if labels and len(labels) == cm_df.shape[0] == cm_df.shape[1]:
+            cm_df.index = [f"Actual: {x}" for x in labels]
+            cm_df.columns = [f"Pred: {x}" for x in labels]
+        st.dataframe(cm_df, use_container_width=True)
         st.caption("Rows = actual, columns = predicted.")
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         c1, c2, c3 = st.columns(3)
         c1.metric("MAE", f"{metrics.get('mae', 0.0):.4f}")
         c2.metric("RMSE", f"{metrics.get('rmse', 0.0):.4f}")
-        c3.metric("R² Score", f"{metrics.get('r2_score', 0.0) * 100:.1f}%")
+        r2v = float(metrics.get("r2_score", 0.0))
+        c3.metric("R² Score", f"{r2v:.4f}")
 
-        st.write("")
-        st.markdown('<div class="ns-card" style="border-color:#a7f3d0; background:#ecfdf5;">', unsafe_allow_html=True)
-        st.write("### Model Performance Summary")
-        st.write(f"Your model explains **{metrics.get('r2_score', 0.0) * 100:.1f}%** of the variance.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        if "channels_used" in metrics:
+            st.write("")
+            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+            st.write("### LSTM Details")
+            st.write(f"Channels used: **{metrics.get('channels_used')}** (features + target)")
+            st.write(f"Lookback: **{metrics.get('lookback_used')}** • Horizon: **{metrics.get('horizon_used')}**")
+            st.write(f"Rows used: **{metrics.get('rows_used')}**")
+            st.write(f"Train sequences: **{metrics.get('train_sequences')}** • Test sequences: **{metrics.get('test_sequences')}**")
+            st.markdown("</div>", unsafe_allow_html=True)
 
     p["status"] = "evaluated"
     upsert_project(p)
 
     st.write("")
     st.markdown('<div class="btn-grad">', unsafe_allow_html=True)
-    if st.button("Make Predictions ➜", use_container_width=True):
-        st.query_params["page"] = "predict"
+    st.button("Make Predictions ➜", use_container_width=True, on_click=request_nav, args=("predict",))
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1463,17 +1627,14 @@ def page_predict():
 
             meta = p.get("feature_meta", {}) or {}
             vals: Dict[str, Any] = {}
-            cols = st.columns(2)
+            cols2 = st.columns(2)
 
             for i, f in enumerate(features):
-                with cols[i % 2]:
+                with cols2[i % 2]:
                     fmeta = meta.get(f, {"type": "numeric"})
                     if fmeta.get("type") == "categorical":
                         options = fmeta.get("options") or []
-                        if options:
-                            vals[f] = st.selectbox(f, options=options, index=0)
-                        else:
-                            vals[f] = st.text_input(f, value="")
+                        vals[f] = st.selectbox(f, options=options, index=0) if options else st.text_input(f, value="")
                     else:
                         vals[f] = st.number_input(f, value=0.0, format="%.6f")
 
@@ -1488,24 +1649,19 @@ def page_predict():
                 row = pd.DataFrame([vals], columns=features)
                 pred, conf = predict_from_df(row, model, preprocessor, task=task, label_encoder=label_encoder)
 
-                st.markdown(
-                    '<div class="ns-card" style="background: linear-gradient(90deg,#06b6d4,#6366f1); color:white;">',
-                    unsafe_allow_html=True)
+                st.markdown('<div class="ns-card" style="background: linear-gradient(90deg,#06b6d4,#6366f1); color:white;">', unsafe_allow_html=True)
                 st.write("### Prediction Result")
-
                 if task == "classification":
                     st.write(f"**Predicted Class:** {pred[0]}")
                     if conf is not None:
                         st.write(f"**Confidence:** {float(conf[0]) * 100:.1f}%")
                 else:
                     st.write(f"**Predicted Value:** {float(pred[0]):.6f}")
-
                 st.markdown("</div>", unsafe_allow_html=True)
 
         with tab2:
             st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-            up = st.file_uploader("Upload CSV or Excel for batch predictions", type=["csv", "xlsx", "xls"],
-                                  key="pred_upload")
+            up = st.file_uploader("Upload CSV or Excel for batch predictions", type=["csv", "xlsx", "xls"], key="pred_upload")
             st.caption("File must include the same feature columns.")
             sheet = None
             df_up = None
@@ -1531,12 +1687,10 @@ def page_predict():
 
                     if gen:
                         X_feat = df_up[features].copy()
-                        preds, conf = predict_from_df(X_feat, model, preprocessor, task=task,
-                                                      label_encoder=label_encoder)
+                        preds, conf = predict_from_df(X_feat, model, preprocessor, task=task, label_encoder=label_encoder)
 
                         out = df_up.copy()
                         out["prediction"] = preds
-
                         if task == "classification" and conf is not None:
                             out["confidence"] = np.round(conf.astype(float), 6)
 
@@ -1544,15 +1698,13 @@ def page_predict():
                         st.dataframe(out.head(20), use_container_width=True)
 
                         csv_bytes = out.to_csv(index=False).encode("utf-8")
-                        st.download_button("Download Results", data=csv_bytes, file_name="predictions.csv",
-                                           mime="text/csv")
+                        st.download_button("Download Results", data=csv_bytes, file_name="predictions.csv", mime="text/csv")
 
     else:
-        # LSTM Predict = Future Forecast
         try:
-            model, scaler, outputs = cached_load_lstm_artifacts(
+            model, pack, outputs = cached_load_lstm_artifacts(
                 artifacts["model_path"],
-                artifacts["scaler_path"],
+                artifacts["pack_path"],
                 artifacts["outputs_path"],
             )
         except Exception as e:
@@ -1560,10 +1712,10 @@ def page_predict():
             return
 
         st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-        st.write("### Future Forecast (LSTM)")
+        st.write("### Future Forecast (Multivariate LSTM)")
         horizon_default = int(p.get("preprocess", {}).get("horizon", 1))
         n_future = st.number_input("Steps to forecast", 1, 2000, int(horizon_default))
-        st.caption("Forecast steps are sequential (one-step ahead repeated).")
+        st.caption("If future feature values are unknown, we hold features constant at the last observed values.")
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown('<div class="btn-emerald">', unsafe_allow_html=True)
@@ -1574,14 +1726,23 @@ def page_predict():
             try:
                 scaled_full = outputs["scaled_full"]
                 lookback = int(artifacts.get("lookback", int(outputs["lookback"][0]) if "lookback" in outputs else 10))
-                future = forecast_future(model, scaler, scaled_full, lookback=lookback, n_steps=int(n_future))
+                last_feat = outputs["last_feature_scaled"]
+                scaler_y = pack["scaler_y"]
+
+                future = forecast_future_multivariate(
+                    model=model,
+                    scaler_y=scaler_y,
+                    scaled_full=scaled_full,
+                    lookback=lookback,
+                    n_steps=int(n_future),
+                    last_feature_scaled=last_feat,
+                )
                 out_df = pd.DataFrame(future, columns=["forecast"])
                 st.success("Forecast generated.")
                 st.dataframe(out_df, use_container_width=True)
 
                 csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-                st.download_button("Download Forecast CSV", data=csv_bytes, file_name="lstm_forecast.csv",
-                                   mime="text/csv")
+                st.download_button("Download Forecast CSV", data=csv_bytes, file_name="lstm_forecast.csv", mime="text/csv")
             except Exception as e:
                 st.error(f"Forecast error: {e}")
 
@@ -1598,11 +1759,9 @@ def page_save_load():
     st.markdown('<div class="ns-card">', unsafe_allow_html=True)
     st.write("### Current Model Info")
     st.write(f"**Project:** {p.get('name')}")
-    st.write(
-        f"**Model:** {p.get('model_type', '—').upper()} • **Task:** {(p.get('evaluation_metrics') or {}).get('task', p.get('task_type', '—'))}")
+    st.write(f"**Model:** {p.get('model_type', '—').upper()} • **Task:** {(p.get('evaluation_metrics') or {}).get('task', p.get('task_type', '—'))}")
     st.write(f"**Status:** {p.get('status', '—')}")
-    st.write("**Features:** " + ", ".join(p.get("columns", {}).get("features", [])[:12]) + (
-        " ..." if len(p.get("columns", {}).get("features", [])) > 12 else ""))
+    st.write("**Features:** " + ", ".join(p.get("columns", {}).get("features", [])[:12]) + (" ..." if len(p.get("columns", {}).get("features", [])) > 12 else ""))
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
@@ -1610,8 +1769,7 @@ def page_save_load():
     st.write("### Save Project Package (JSON)")
     st.caption("Saves UI settings + history + paths. (Model files are stored under .neural_studio/models/)")
     json_bytes = json.dumps(p, indent=2).encode("utf-8")
-    st.download_button("💾 Download JSON", data=json_bytes, file_name="neural_studio_project.json",
-                       mime="application/json")
+    st.download_button("💾 Download JSON", data=json_bytes, file_name="neural_studio_project.json", mime="application/json")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
@@ -1623,8 +1781,15 @@ def page_save_load():
             loaded = json.loads(up.read().decode("utf-8"))
             if "id" not in loaded:
                 loaded["id"] = str(uuid.uuid4())
+            loaded.setdefault("columns", {"target": None, "time": None, "features": []})
+            loaded.setdefault("dataset", {"filename": "—", "rows": 0, "cols": 0, "missing": 0, "path": None, "file_type": None, "sheet": None})
+            loaded.setdefault("preprocess", {"split": 0.8, "seed": 42, "lookback": 20, "horizon": 1, "missing_strategy": "Drop rows"})
+            loaded.setdefault("train_config", {"epochs": 20, "batch_size": 32, "lr": 0.001, "early_stop": True, "patience": 5})
+            loaded.setdefault("ann_config", {"hidden_layers": 3, "neurons": [256, 128, 64], "activation": "ReLU", "output_activation": "Auto"})
+            loaded.setdefault("lstm_config", {"units": 64, "layers": 2, "dropout": 0.2, "bidirectional": False})
+            loaded.setdefault("viz_cache", {})
             upsert_project(loaded)
-            st.success("Loaded and set as current project.")
+            request_nav("data")
         except Exception as e:
             st.error(f"Failed to load JSON: {e}")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1658,15 +1823,39 @@ def page_visualize():
         st.info("No training history yet. Train the model first.")
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # -----------------------------
+    # Residual Plot (ANN Regression) - restored ✅
+    # -----------------------------
+    viz = (p.get("viz_cache") or {}).get("ann_regression")
+    if viz:
+        try:
+            y_test = np.array(viz["y_test"], dtype=float)
+            y_pred = np.array(viz["y_pred"], dtype=float)
+            residuals = y_test - y_pred
+
+            st.write("")
+            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+            st.write("### Residual Plot (ANN Regression)")
+            fig_r = plt.figure()
+            plt.scatter(y_pred, residuals, alpha=0.6)
+            plt.axhline(0)
+            plt.xlabel("Predicted")
+            plt.ylabel("Residual (actual - predicted)")
+            st.pyplot(fig_r, clear_figure=True)
+            st.caption("Good model: residuals scattered around 0 without a clear pattern.")
+            st.markdown("</div>", unsafe_allow_html=True)
+        except Exception:
+            pass
+
     artifacts = p.get("artifacts") or {}
     if artifacts.get("kind") == "lstm":
         st.write("")
         st.markdown('<div class="ns-card">', unsafe_allow_html=True)
         st.write("### LSTM Predictions vs Actual")
         try:
-            model, scaler, outputs = cached_load_lstm_artifacts(
+            model, pack, outputs = cached_load_lstm_artifacts(
                 artifacts["model_path"],
-                artifacts["scaler_path"],
+                artifacts["pack_path"],
                 artifacts["outputs_path"],
             )
 
@@ -1691,43 +1880,25 @@ def page_visualize():
             st.info(f"LSTM plot not available: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    metrics = p.get("evaluation_metrics") or {}
-    if metrics.get("task") == "regression" and artifacts.get("kind") == "ann":
-        st.write("")
-        st.markdown('<div class="ns-card">', unsafe_allow_html=True)
-        st.write("### Residual Plot (sample)")
-        st.caption("For a good model, residuals should scatter around 0.")
-
+        # LSTM residual plot (bonus)
         try:
-            df = load_project_dataset(p)
-            features = p.get("columns", {}).get("features", [])
-            target = p.get("columns", {}).get("target")
-            if features and target:
-                model, preprocessor, le = cached_load_ann_artifacts(
-                    p["artifacts"]["model_path"],
-                    p["artifacts"]["preprocessor_path"],
-                    p["artifacts"]["label_encoder_path"],
-                )
+            y_test_l = outputs["y_test_actual"].reshape(-1)
+            y_pred_l = outputs["test_pred_actual"].reshape(-1)
+            residuals_l = y_test_l - y_pred_l
 
-                X = df[features].copy()
-                y = pd.to_numeric(df[target], errors="coerce").astype(float)
-                keep = ~np.isnan(y.values)
-                X = X.loc[keep]
-                y = y.loc[keep].values
-
-                preds, _ = predict_from_df(X, model, preprocessor, task="regression", label_encoder=le)
-                residuals = y - preds
-
-                fig = plt.figure()
-                plt.scatter(preds, residuals, alpha=0.6)
-                plt.axhline(0, linewidth=1)
-                plt.xlabel("Predicted")
-                plt.ylabel("Residual (actual - predicted)")
-                st.pyplot(fig, clear_figure=True)
-        except Exception as e:
-            st.info(f"Residual plot not available: {e}")
-
-        st.markdown("</div>", unsafe_allow_html=True)
+            st.write("")
+            st.markdown('<div class="ns-card">', unsafe_allow_html=True)
+            st.write("### Residual Plot (LSTM Test)")
+            fig_rl = plt.figure()
+            plt.scatter(y_pred_l, residuals_l, alpha=0.6)
+            plt.axhline(0)
+            plt.xlabel("Predicted")
+            plt.ylabel("Residual (actual - predicted)")
+            st.pyplot(fig_rl, clear_figure=True)
+            st.caption("Based on the saved LSTM test predictions.")
+            st.markdown("</div>", unsafe_allow_html=True)
+        except Exception:
+            pass
 
     st.write("")
     st.markdown('<div class="ns-card" style="border-color:#a7f3d0; background:#ecfdf5;">', unsafe_allow_html=True)
@@ -1760,6 +1931,9 @@ def main():
     st.set_page_config(page_title="Neural Studio", layout="wide")
     inject_css()
 
+    # Apply pending navigation at the start of each run (fixes double-click)
+    apply_pending_nav()
+
     with st.sidebar:
         st.markdown("## Neural Studio")
         st.caption("ML workflow builder (Python UI)")
@@ -1785,22 +1959,20 @@ def main():
 
         chosen_key = page_keys[labels.index(chosen)]
         if chosen_key != active_key:
-            st.query_params["page"] = chosen_key
-            st.rerun()
+            request_nav(chosen_key)
 
         st.write("---")
         if st.button("➕ New Project", use_container_width=True):
             new_project()
-            st.success("Created new project.")
-            st.query_params["page"] = "data"
-            st.rerun()
+            request_nav("data")
 
         if st.button("🗑️ Clear Current Project", use_container_width=True):
             if CURRENT_FILE.exists():
                 CURRENT_FILE.unlink()
-            st.success("Cleared current project.")
-            st.query_params["page"] = "home"
-            st.rerun()
+            request_nav("home")
+
+    # Apply nav requests from sidebar/buttons
+    apply_pending_nav()
 
     active_key = st.query_params.get("page", "home")
     if active_key not in PAGES:
